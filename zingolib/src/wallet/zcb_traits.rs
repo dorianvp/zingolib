@@ -205,13 +205,15 @@ impl WalletRead for LightWallet {
             return Ok(None);
         };
 
-        let max_checkpoint_height = self
+        let Some(max_checkpoint_height) = self
             .shard_trees
             .sapling
             .store()
             .max_checkpoint_id()
             .expect("infallible")
-            .expect("should be at least 1 checkpoint");
+        else {
+            return Ok(None);
+        };
 
         let anchor_height = std::cmp::min(
             max_checkpoint_height,

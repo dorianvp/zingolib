@@ -1233,6 +1233,11 @@ impl ShardTrees {
                 Checkpoint::from_parts(tree_state, marks_removed.into_iter().collect()),
             ))
         })?;
+        if checkpoints.is_empty() {
+            store
+                .add_checkpoint(C::from(0), Checkpoint::tree_empty())
+                .expect("Infallible");
+        }
         for (checkpoint_id, checkpoint) in checkpoints {
             store
                 .add_checkpoint(checkpoint_id, checkpoint)
