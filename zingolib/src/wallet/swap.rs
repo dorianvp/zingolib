@@ -17,9 +17,9 @@
 //!
 //! [`LightWallet`] exposes the two building blocks used by
 //! `LightClient::propose_swap_deposit`:
-//! [`LightWallet::op_return_carrier_fee`] (so the deshield can fund the
+//! `LightWallet::op_return_carrier_fee` (so the deshield can fund the
 //! carrier exactly, leaving zero change) and
-//! [`LightWallet::build_op_return_carrier`] (the hand-built carrier).
+//! `LightWallet::build_op_return_carrier` (the hand-built carrier).
 
 use rand::rngs::OsRng;
 
