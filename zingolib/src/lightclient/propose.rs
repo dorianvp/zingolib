@@ -636,6 +636,107 @@ mod send_all {
         assert_eq!(change, 0);
     }
 
+    #[tokio::test]
+    async fn send_all_with_zfz_correction_cannot_cover_the_fee_increase() {
+        let mut client = LightClient::new_for_test(
+            SyntheticWalletBuilder::new(zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED)
+                .orchard_note(1_000_000)
+                .sapling_note(25_000)
+                .build(),
+        )
+        .await;
+
+        let proposal_error = client
+            .propose_send_all(
+                external_address(PoolType::SAPLING),
+                true,
+                None,
+                zip32::AccountId::ZERO,
+            )
+            .await;
+        match proposal_error {
+            Err(ProposeSendError::Proposal(
+                zcash_client_backend::data_api::error::Error::InsufficientFunds {
+                    available: a,
+                    required: r,
+                },
+            )) => {
+                assert_eq!(a, Zatoshis::const_from_u64(1_025_000));
+                assert_eq!(r, Zatoshis::const_from_u64(1_035_000));
+            }
+            _ => panic!("expected an InsufficientFunds error"),
+        }
+
+        assert_eq!(
+            client
+                .max_send_value(
+                    external_address(PoolType::SAPLING),
+                    true,
+                    zip32::AccountId::ZERO
+                )
+                .await
+                .unwrap(),
+            Zatoshis::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn send_all_rejects_a_memo_to_a_transparent_recipient() {
+        let mut client = LightClient::new_for_test(
+            SyntheticWalletBuilder::new(zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED)
+                .orchard_note(100_000)
+                .build(),
+        )
+        .await;
+        let memo = zcash_protocol::memo::MemoBytes::from_bytes(b"memo").unwrap();
+
+        let proposal_error = client
+            .propose_send_all(
+                external_transparent_address(),
+                false,
+                Some(memo),
+                zip32::AccountId::ZERO,
+            )
+            .await;
+        assert!(matches!(
+            proposal_error,
+            Err(ProposeSendError::Proposal(
+                zcash_client_backend::data_api::error::Error::Payment(
+                    zcash_client_backend::zip321::PaymentError::TransparentMemo
+                )
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_all_on_an_unsynced_wallet_requires_a_scan() {
+        let config = crate::config::ClientConfig::builder()
+            .set_wallet_config(crate::config::WalletConfig::MnemonicPhrase {
+                mnemonic_phrase: zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED.to_string(),
+                no_of_accounts: 1.try_into().unwrap(),
+                birthday: 419200,
+                wallet_settings: crate::testutils::default_test_wallet_settings(),
+            })
+            .build()
+            .unwrap();
+        let mut client = LightClient::new(config, true).await.unwrap();
+
+        let proposal_error = client
+            .propose_send_all(
+                external_address(PoolType::ORCHARD),
+                false,
+                None,
+                zip32::AccountId::ZERO,
+            )
+            .await;
+        assert!(matches!(
+            proposal_error,
+            Err(ProposeSendError::Proposal(
+                zcash_client_backend::data_api::error::Error::ScanRequired
+            ))
+        ));
+    }
+
     /// Migrated from libtonode `send_all::toggle_zennies_for_zingo`: with
     /// Zennies for Zingo enabled, the maximum sendable value deducts the
     /// zenny amount and the fee for one ironwood note in, three outputs
