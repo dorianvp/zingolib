@@ -99,6 +99,14 @@ impl LightWallet {
     /// less the fee, to `address`. With `zennies_for_zingo` set, a
     /// [`ZENNIES_FOR_ZINGO_AMOUNT`] payment is added and the send-all
     /// amount is reduced to cover it.
+    ///
+    /// The zenny variant is sized by a send-max proposal over every
+    /// spendable note. The two-payment request is proposed once. If the
+    /// extra output raised the fee, it is proposed a second time with the
+    /// recipient amount reduced by that increase. The corrected request
+    /// sums to the sized input total. Selection takes every note, the
+    /// output count is unchanged, and the fee is the same. The second
+    /// result is final.
     pub(crate) fn create_send_all_proposal(
         &mut self,
         address: ZcashAddress,
