@@ -631,6 +631,7 @@ mod send_all {
             .iter()
             .map(|change| u64::from(change.value()))
             .sum();
+        assert_eq!(fee, 30_000);
         assert_eq!(payment + fee, initial_funds);
         assert_eq!(change, 0);
     }
