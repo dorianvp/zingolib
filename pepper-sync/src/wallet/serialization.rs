@@ -1233,6 +1233,11 @@ impl ShardTrees {
                 Checkpoint::from_parts(tree_state, marks_removed.into_iter().collect()),
             ))
         })?;
+        if checkpoints.is_empty() {
+            store
+                .add_checkpoint(C::from(0), Checkpoint::tree_empty())
+                .expect("Infallible");
+        }
         for (checkpoint_id, checkpoint) in checkpoints {
             store
                 .add_checkpoint(checkpoint_id, checkpoint)
@@ -1623,6 +1628,53 @@ mod tests {
         }
         assert_window(sapling_store, oldest_kept);
         assert_window(orchard_store, oldest_kept);
+    }
+
+    /// A blob with no checkpoint reads back with the height-zero checkpoint.
+    #[test]
+    fn shardtree_read_adds_initialization_checkpoint_when_blob_has_none() {
+        fn checkpoint_less<H, const DEPTH: u8, const SHARD_HEIGHT: u8>()
+        -> ShardTree<MemoryShardStore<H, BlockHeight>, DEPTH, SHARD_HEIGHT>
+        where
+            H: Hashable + Clone + PartialEq,
+        {
+            ShardTree::new(
+                MemoryShardStore::empty(),
+                SHARDTREE_CHECKPOINT_ROLLING_WINDOW_SIZE as usize,
+            )
+        }
+
+        let mut shard_trees = ShardTrees {
+            sapling: checkpoint_less(),
+            orchard: checkpoint_less(),
+            ironwood: checkpoint_less(),
+        };
+        assert_eq!(
+            shard_trees
+                .sapling
+                .store()
+                .max_checkpoint_id()
+                .expect("infallible"),
+            None
+        );
+
+        let mut bytes = Vec::new();
+        shard_trees.write(&mut bytes).expect("write should succeed");
+        let roundtripped = ShardTrees::read(bytes.as_slice()).expect("read should succeed");
+
+        fn assert_initialization_checkpoint<S>(store: &S)
+        where
+            S: ShardStore<CheckpointId = BlockHeight, Error = std::convert::Infallible>,
+        {
+            assert_eq!(store.checkpoint_count().expect("infallible"), 1);
+            assert_eq!(
+                store.max_checkpoint_id().expect("infallible"),
+                Some(BlockHeight::from_u32(0))
+            );
+        }
+        assert_initialization_checkpoint(roundtripped.sapling.store());
+        assert_initialization_checkpoint(roundtripped.orchard.store());
+        assert_initialization_checkpoint(roundtripped.ironwood.store());
     }
 
     /// A pinned anchor checkpoint survives serialization even once it has aged out of the
