@@ -244,7 +244,11 @@ mod tests {
             match resolve_send_route(TransmitPolicy::Mixnet, mode, Some(session.clone())) {
                 Ok(MixnetRoute::Mixnet(routed)) => {
                     let _held = routed.dial();
-                    assert_eq!(session.in_flight(), 1, "the send must ride the session's conduit");
+                    assert_eq!(
+                        session.in_flight(),
+                        1,
+                        "the send must ride the session's conduit"
+                    );
                 }
                 other => panic!("{mode} must route through the proxy, got {other:?}"),
             }
