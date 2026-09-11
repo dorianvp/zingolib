@@ -795,8 +795,13 @@ impl LightClient {
         reports
     }
 
-    /// Transmits the deshield of `proposal`, then builds and transmits the
-    /// OP_RETURN send that spends it.
+    /// Reserves the source address of `proposal`, transmits its deshield,
+    /// then builds and transmits the OP_RETURN send that spends it.
+    ///
+    /// The source address must still be the next unreserved Refund-scope
+    /// address. If another send reserved it after the proposal was made,
+    /// the proposal is stale and is refused. A deshield that fails before
+    /// transmission releases the reservation.
     ///
     /// If the OP_RETURN send fails to transmit, it stays in the wallet with
     /// `Calculated` status. The deshield is already on the network.
@@ -806,9 +811,38 @@ impl LightClient {
         &mut self,
         proposal: OpReturnProposal,
     ) -> Result<NonEmpty<TransmitReport>, LightClientError> {
-        let deshield_reports = self
-            .send(proposal.deshield().clone(), proposal.sending_account())
-            .await?;
+        let account = proposal.sending_account();
+        let highest_before = {
+            let mut wallet = self.wallet().write().await;
+            let (next_id, next_address) = wallet
+                .derive_refund_addresses(1, account)
+                .map_err(|e| SendError::OpReturn(WalletError::from(e)))?[0];
+            if next_id != proposal.source_address_id() || next_address != *proposal.source_address()
+            {
+                return Err(SendError::OpReturnSourceAddressStale.into());
+            }
+            let highest_before = wallet.highest_refund_address_index();
+            wallet
+                .generate_refund_addresses(1, account)
+                .map_err(|e| SendError::OpReturn(WalletError::from(e)))?;
+            highest_before
+        };
+
+        let deshield_reports = match self.send(proposal.deshield().clone(), account).await {
+            Ok(reports) => reports,
+            Err(e) => {
+                if matches!(
+                    e,
+                    LightClientError::SendError(SendError::CalculateSendError(_))
+                ) {
+                    self.wallet()
+                        .write()
+                        .await
+                        .truncate_refund_addresses(highest_before);
+                }
+                return Err(e);
+            }
+        };
         let deshield_txid = deshield_reports.first().txid;
 
         let op_return_txid = {

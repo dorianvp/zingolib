@@ -189,6 +189,12 @@ pub enum SendError {
     /// Its second transaction spends an output of the first.
     #[error("An OP_RETURN proposal cannot be calculated without transmitting.")]
     OpReturnNotCalculable,
+    /// The OP_RETURN proposal's source address was reserved by another send
+    /// after the proposal was made. Propose again.
+    #[error(
+        "The OP_RETURN proposal is stale: its source address is no longer next. Propose again."
+    )]
+    OpReturnSourceAddressStale,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -9,12 +9,12 @@ use crate::data::proposal::OpReturnProposal;
 use crate::data::proposal::ProportionalFeeProposal;
 use crate::data::proposal::ProportionalFeeShieldProposal;
 use crate::data::proposal::ZingoProposal;
+use crate::data::receivers::Receiver;
+use crate::data::receivers::transaction_request_from_receivers;
 use crate::lightclient::LightClient;
 use crate::lightclient::error::{LightClientError, SendError};
 use crate::wallet::error::ProposeSendError;
 use crate::wallet::error::ProposeShieldError;
-use crate::data::receivers::Receiver;
-use crate::data::receivers::transaction_request_from_receivers;
 use crate::wallet::error::WalletError;
 use crate::wallet::propose::recipient_amount;
 use crate::wallet::transparent::OpReturnData;
@@ -108,9 +108,10 @@ impl LightClient {
     /// address `recipient` with `data` in an OP_RETURN (null-data) output.
     /// Holds the same stored-proposal pause as [`Self::propose_send`].
     ///
-    /// The proposal reserves a new ephemeral transparent address. The
-    /// address is not released if the proposal is dropped. See
-    /// [`OpReturnProposal`] for the two transactions the proposal
+    /// The ephemeral source address is derived, not reserved. The wallet
+    /// reserves it in [`Self::send_stored_proposal`], when the deshield
+    /// is built. A dropped proposal leaves no trace in the address book.
+    /// See [`OpReturnProposal`] for the two transactions the proposal
     /// describes and the fees it reports.
     pub async fn propose_send_with_op_return(
         &mut self,
@@ -135,7 +136,7 @@ impl LightClient {
         result
     }
 
-    /// Builds an [`OpReturnProposal`] without storing it. Reserves the
+    /// Builds an [`OpReturnProposal`] without storing it. Derives the next
     /// ephemeral source address, sizes the OP_RETURN send fee, and creates
     /// the deshield proposal for `amount` plus that fee.
     pub(crate) async fn create_op_return_proposal(
@@ -158,7 +159,7 @@ impl LightClient {
             .map_err(|_| SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent))?;
 
         let (source_address_id, source_address) = wallet
-            .generate_refund_addresses(1, account_id)
+            .derive_refund_addresses(1, account_id)
             .map_err(|e| SendError::OpReturn(WalletError::from(e)))?
             .into_iter()
             .next()
@@ -2119,8 +2120,8 @@ mod op_return {
     }
 
     /// The proposal is stored as an OP_RETURN proposal. The deshield pays
-    /// the amount plus the OP_RETURN fee to a Refund-scope address. The
-    /// total fee is the sum of both fees.
+    /// the amount plus the OP_RETURN fee to the next Refund-scope address.
+    /// The total fee is the sum of both fees. The address is not reserved.
     #[tokio::test]
     async fn proposal_is_stored_and_reports_both_fees() {
         let mut client = client().await;
@@ -2148,25 +2149,22 @@ mod op_return {
         let mut wallet = client.wallet().write().await;
         let stored = wallet.take_proposal().expect("proposal stored");
         assert!(matches!(stored, ZingoProposal::OpReturn(_)));
-        let source_id = wallet
-            .transparent_addresses()
-            .keys()
-            .find(|id| id.scope() == TransparentScope::Refund)
-            .expect("an ephemeral address was reserved");
-        let encoded = wallet.transparent_addresses()[source_id].clone();
+        let (next_id, next_address) = wallet.derive_refund_addresses(1, ACCOUNT).unwrap()[0];
         assert_eq!(
-            encoded,
-            pepper_sync::keys::transparent::encode_address(
-                &wallet.chain_type(),
-                *proposal.source_address()
-            ),
-            "the deshield pays the reserved Refund-scope address"
+            proposal.source_address(),
+            &next_address,
+            "the deshield pays the next Refund-scope address"
+        );
+        assert!(
+            !wallet.transparent_addresses().contains_key(&next_id),
+            "proposing does not reserve the address"
         );
     }
 
-    /// Each proposal reserves a new ephemeral address.
+    /// Proposing twice derives the same source address. Neither call
+    /// reserves it.
     #[tokio::test]
-    async fn each_proposal_reserves_a_new_source_address() {
+    async fn proposing_does_not_reserve_the_source_address() {
         let mut client = client().await;
         let amount = Zatoshis::const_from_u64(100_000);
 
@@ -2179,7 +2177,15 @@ mod op_return {
             .await
             .unwrap();
 
-        assert_ne!(first.source_address(), second.source_address());
+        assert_eq!(first.source_address(), second.source_address());
+        let wallet = client.wallet().read().await;
+        assert!(
+            wallet
+                .transparent_addresses()
+                .keys()
+                .all(|id| id.scope() != TransparentScope::Refund),
+            "no Refund-scope address was reserved"
+        );
     }
 
     /// A shielded recipient is refused. Nothing is stored.

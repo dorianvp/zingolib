@@ -48,10 +48,11 @@ pub(crate) enum ZingoProposal {
 /// A proposed OP_RETURN send. It is split into two transactions.
 ///
 /// The first is the deshield. It moves `amount` plus `op_return_fee` from
-/// shielded funds to `source_address`, an ephemeral transparent address
-/// reserved for this proposal. The second is the OP_RETURN send. It spends
-/// that output to `recipient` and carries `data` in a null-data output.
-/// The second transaction has no change output.
+/// shielded funds to `source_address`, the next ephemeral transparent
+/// address of the account. The address is derived at proposal time and
+/// reserved when the deshield is built. The second is the OP_RETURN send.
+/// It spends that output to `recipient` and carries `data` in a null-data
+/// output. The second transaction has no change output.
 ///
 /// The second transaction cannot be built before the first exists. Its
 /// fee is fixed at proposal time and is reported by
@@ -111,7 +112,7 @@ impl OpReturnProposal {
     }
 
     /// The ephemeral transparent address the deshield pays and the
-    /// OP_RETURN send spends.
+    /// OP_RETURN send spends. Reserved when the deshield is built.
     pub fn source_address(&self) -> &TransparentAddress {
         &self.source_address
     }
