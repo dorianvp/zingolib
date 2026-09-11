@@ -2776,6 +2776,60 @@ mod test {
             // The wallet was cleared for rescan.
             assert!(wallet.get_wallet_block(BlockHeight::from_u32(6)).is_err());
         }
+
+        /// The balance path reads the newest sapling checkpoint as the anchor.
+        fn assert_every_tree_holds_a_checkpoint(wallet: &mut crate::mocks::MockWallet) {
+            use crate::wallet::traits::SyncShardTrees;
+            use shardtree::store::ShardStore as _;
+
+            let shard_trees = wallet.get_shard_trees_mut().unwrap();
+            let sapling = shard_trees.sapling.store().max_checkpoint_id().unwrap();
+            let orchard = shard_trees.orchard.store().max_checkpoint_id().unwrap();
+            let ironwood = shard_trees.ironwood.store().max_checkpoint_id().unwrap();
+            assert!(
+                sapling.is_some() && orchard.is_some() && ironwood.is_some(),
+                "a shard tree lost its last checkpoint: sapling {sapling:?}, orchard {orchard:?}, ironwood {ironwood:?}"
+            );
+        }
+
+        /// A target below the birthday clears every store but keeps a checkpoint.
+        #[test]
+        fn clear_all_truncation_leaves_a_checkpoint_in_every_tree() {
+            let mut shard_trees = ShardTrees::new();
+            for height in 6..=10u32 {
+                shard_trees
+                    .sapling
+                    .append_checkpoint(BlockHeight::from_u32(height))
+                    .unwrap();
+            }
+            let mut wallet = synced_wallet(shard_trees);
+
+            truncate_wallet_data(&mut wallet, BlockHeight::from_u32(3)).unwrap();
+
+            assert!(wallet.get_wallet_block(BlockHeight::from_u32(6)).is_err());
+            assert_every_tree_holds_a_checkpoint(&mut wallet);
+        }
+
+        /// The rescan recovery must also leave a checkpoint in every tree.
+        #[test]
+        fn rescan_recovery_leaves_a_checkpoint_in_every_tree() {
+            let mut shard_trees = ShardTrees::new();
+            for height in 9..=10u32 {
+                shard_trees
+                    .orchard
+                    .append_checkpoint(BlockHeight::from_u32(height))
+                    .unwrap();
+            }
+            let mut wallet = synced_wallet(shard_trees);
+
+            let result = truncate_wallet_data(&mut wallet, BlockHeight::from_u32(8));
+
+            assert!(matches!(
+                result,
+                Err(crate::error::SyncError::TruncationError(_, _))
+            ));
+            assert_every_tree_holds_a_checkpoint(&mut wallet);
+        }
     }
 
     /// The pool-accounting contract of [`crate::sync::sync_status`]:
