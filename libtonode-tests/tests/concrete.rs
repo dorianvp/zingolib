@@ -1689,12 +1689,14 @@ async fn mine_to_transparent_coinbase_maturity() {
     assert_eq!(mature_balance, scenarios::mined_block_rewards_total(3));
 }
 
-/// `send_transparent_with_op_return` broadcasts a deshield and a
-/// transparent-only transaction from a shielded balance. After mining,
-/// both confirm. The second transaction pays the recipient, carries the
-/// payload in an OP_RETURN output, and has no change.
+/// `propose_send_with_op_return` reports the fee of both transactions.
+/// `send_stored_proposal` broadcasts a deshield and a transparent-only
+/// transaction from a shielded balance. After mining, both confirm. The
+/// second transaction pays the recipient, carries the payload in an
+/// OP_RETURN output, and has no change. The deshield pays exactly the
+/// amount plus the OP_RETURN fee.
 #[tokio::test]
-async fn send_transparent_with_op_return_confirms_on_chain() {
+async fn propose_and_send_with_op_return_confirms_on_chain() {
     use zingolib::wallet::transparent::OpReturnData;
 
     /// A payload under the 80-byte limit.
@@ -1718,23 +1720,27 @@ async fn send_transparent_with_op_return_confirms_on_chain() {
     let recipient_address = get_base_address_macro!(faucet, "transparent");
     let data = OpReturnData::new(PAYLOAD.to_vec()).unwrap();
 
-    let reports = recipient
-        .send_transparent_with_op_return(
-            &recipient_address,
-            amount,
-            data,
-            zip32::AccountId::ZERO,
-            false,
-        )
+    let proposal = recipient
+        .propose_send_with_op_return(&recipient_address, amount, data, zip32::AccountId::ZERO)
         .await
         .unwrap();
+    let op_return_fee = proposal.op_return_fee();
+    let deshield_fee = proposal.deshield_fee().unwrap();
     assert_eq!(
-        reports.len(),
-        2,
-        "a deshield and an OP_RETURN send are sent"
+        proposal.total_fee().unwrap(),
+        (deshield_fee + op_return_fee).unwrap(),
+        "total fee is the sum of both transaction fees"
     );
-    let deshield_txid = reports[0].txid;
-    let op_return_txid = reports[1].txid;
+    assert_eq!(
+        zingolib::data::proposal::total_payment_amount(proposal.deshield()).unwrap(),
+        (amount + op_return_fee).unwrap(),
+        "the deshield pays the amount plus the OP_RETURN fee"
+    );
+
+    let txids = recipient.send_stored_proposal(false).await.unwrap();
+    assert_eq!(txids.len(), 2, "a deshield and an OP_RETURN send are sent");
+    let deshield_txid = txids[0];
+    let op_return_txid = txids[1];
 
     increase_height_and_wait_for_client(local_net, &mut recipient, 3)
         .await

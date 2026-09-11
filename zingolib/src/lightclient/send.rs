@@ -19,7 +19,7 @@ use zingo_netutils::lightwallet_protocol::{RawTransaction, TxFilter};
 use zingo_status::confirmation_status::ConfirmationStatus;
 
 use crate::config::ChainType;
-use crate::data::proposal::ZingoProposal;
+use crate::data::proposal::{OpReturnProposal, ZingoProposal};
 use crate::lightclient::error::{LightClientError, SendError, TransmissionError};
 use crate::lightclient::indexer_history::{
     AttemptKind, AttemptRoute, FailureKind, IndexerAttempt, IndexerHistoryHandle, now_unix_secs,
@@ -594,6 +594,7 @@ impl LightClient {
                     proposal,
                     shielding_account,
                 } => self.shield(proposal, shielding_account).await,
+                ZingoProposal::OpReturn(proposal) => self.send_op_return(proposal).await,
             };
 
             self.release_proposal_pause(resume_sync);
@@ -667,6 +668,10 @@ impl LightClient {
                         .map_err(SendError::CalculateShieldError),
                     Err(e) => Err(e),
                 }
+            }
+            ZingoProposal::OpReturn(proposal) => {
+                wallet.store_proposal(ZingoProposal::OpReturn(proposal));
+                return Err(SendError::OpReturnNotCalculable.into());
             }
         };
         drop(wallet);
@@ -755,22 +760,17 @@ impl LightClient {
         reports
     }
 
-    /// Sends `amount` to the transparent address `recipient` with `data`
-    /// in an OP_RETURN (null-data) output.
+    /// Proposes and transmits an OP_RETURN send skipping proposal
+    /// confirmation. See [`Self::propose_send_with_op_return`] for the
+    /// proposal and [`OpReturnProposal`] for the two transactions.
     ///
-    /// The send is two transactions with the same shape as a ZIP-320 TEX
-    /// pair. The first is a deshield from shielded funds to a newly
-    /// reserved ephemeral transparent address. The second is a
-    /// transparent-only transaction that spends that output to
-    /// `recipient` and carries `data` in an OP_RETURN. The deshield funds
-    /// the second transaction to the exact amount plus fee. The second
-    /// transaction has no change output. Its single transparent input
-    /// identifies the sender on chain.
-    ///
-    /// The ephemeral address is used once. Each call reserves a new one.
+    /// If sync is running, it is paused before creating the proposal. If
+    /// `resume_sync` is `true`, the engine is restored to its prior mode
+    /// after the send. If `false`, it stays paused for the caller to
+    /// resume.
     ///
     /// Returns the transmit reports for both transactions, deshield first.
-    pub async fn send_transparent_with_op_return(
+    pub async fn quick_send_with_op_return(
         &mut self,
         recipient: &str,
         amount: zcash_protocol::value::Zatoshis,
@@ -778,98 +778,54 @@ impl LightClient {
         account_id: zip32::AccountId,
         resume_sync: bool,
     ) -> Result<NonEmpty<TransmitReport>, LightClientError> {
-        use zcash_protocol::consensus::Parameters as _;
-
-        use crate::data::receivers::{Receiver, transaction_request_from_receivers};
-        use crate::wallet::error::WalletError;
-
-        let (deshield_request, source_address_id, source_address, recipient, target_height) = {
-            let mut wallet = self.wallet().write().await;
-            let chain_type = wallet.chain_type();
-
-            let recipient = zcash_address::ZcashAddress::try_from_encoded(recipient)
-                .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?
-                .convert_if_network::<zcash_transparent::address::TransparentAddress>(
-                    chain_type.network_type(),
-                )
-                .map_err(|_| SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent))?;
-
-            let (source_address_id, source_address) = wallet
-                .generate_refund_addresses(1, account_id)
-                .map_err(|e| SendError::OpReturn(WalletError::from(e)))?
-                .into_iter()
-                .next()
-                .expect("a request for one address yields one address");
-
-            let target_height = wallet
-                .get_migration_heights()
-                .map_err(SendError::OpReturn)?
-                .ok_or(SendError::OpReturn(WalletError::NoSyncData))?
-                .0;
-
-            let send_fee = wallet
-                .op_return_send_fee(
-                    account_id,
-                    source_address_id,
-                    &source_address,
-                    &recipient,
-                    amount,
-                    &data,
-                    target_height,
-                )
-                .map_err(SendError::OpReturn)?;
-
-            let deshield_amount = (amount + send_fee).ok_or_else(|| {
-                SendError::OpReturn(WalletError::TransparentBuild(
-                    "deshield amount overflows the zatoshi range".to_string(),
-                ))
-            })?;
-
-            let source_zcash_address = zcash_address::ZcashAddress::try_from_encoded(
-                &pepper_sync::keys::transparent::encode_address(&chain_type, source_address),
-            )
-            .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?;
-
-            let deshield_request = transaction_request_from_receivers(vec![Receiver::new(
-                source_zcash_address,
-                deshield_amount,
-                None,
-            )])
-            .map_err(|e| {
-                SendError::OpReturn(WalletError::TransparentBuild(format!(
-                    "deshield request: {e}"
-                )))
-            })?;
-
-            (
-                deshield_request,
-                source_address_id,
-                source_address,
-                recipient,
-                target_height,
-            )
+        let guard = self.pause_sync_scoped().ok();
+        let reports = match self
+            .create_op_return_proposal(recipient, amount, data, account_id)
+            .await
+        {
+            Ok(proposal) => self.send_op_return(proposal).await,
+            Err(e) => Err(e),
         };
+        if let Some(guard) = guard
+            && !resume_sync
+        {
+            guard.disarm();
+        }
 
+        reports
+    }
+
+    /// Transmits the deshield of `proposal`, then builds and transmits the
+    /// OP_RETURN send that spends it.
+    ///
+    /// If the OP_RETURN send fails to transmit, it stays in the wallet with
+    /// `Calculated` status. The deshield is already on the network.
+    ///
+    /// Returns the transmit reports for both transactions, deshield first.
+    async fn send_op_return(
+        &mut self,
+        proposal: OpReturnProposal,
+    ) -> Result<NonEmpty<TransmitReport>, LightClientError> {
         let deshield_reports = self
-            .quick_send_reported(deshield_request, account_id, resume_sync)
+            .send(proposal.deshield().clone(), proposal.sending_account())
             .await?;
         let deshield_txid = deshield_reports.first().txid;
 
         let op_return_txid = {
             let mut wallet = self.wallet().write().await;
             let (source_outpoint, source_txout) = wallet
-                .find_transparent_output(deshield_txid, &source_address)
+                .find_transparent_output(deshield_txid, proposal.source_address())
                 .map_err(SendError::OpReturn)?;
             wallet
                 .build_op_return_send(
-                    account_id,
-                    source_address_id,
+                    proposal.sending_account(),
+                    proposal.source_address_id(),
                     source_outpoint,
                     source_txout,
-                    &recipient,
-                    amount,
-                    &data,
-                    target_height,
+                    proposal.recipient(),
+                    proposal.amount(),
+                    proposal.data(),
+                    proposal.target_height(),
                 )
                 .map_err(SendError::OpReturn)?
         };

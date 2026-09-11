@@ -185,6 +185,10 @@ pub enum SendError {
     /// OP_RETURN send error.
     #[error("OP_RETURN send error. {0}")]
     OpReturn(crate::wallet::error::WalletError),
+    /// An OP_RETURN proposal cannot be calculated without transmitting.
+    /// Its second transaction spends an output of the first.
+    #[error("An OP_RETURN proposal cannot be calculated without transmitting.")]
+    OpReturnNotCalculable,
 }
 
 #[derive(Debug, thiserror::Error)]

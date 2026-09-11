@@ -5,6 +5,7 @@ use zcash_client_backend::zip321::TransactionRequest;
 use zcash_protocol::value::Zatoshis;
 
 use crate::ZENNIES_FOR_ZINGO_AMOUNT;
+use crate::data::proposal::OpReturnProposal;
 use crate::data::proposal::ProportionalFeeProposal;
 use crate::data::proposal::ProportionalFeeShieldProposal;
 use crate::data::proposal::ZingoProposal;
@@ -12,8 +13,11 @@ use crate::data::receivers::Receiver;
 use crate::data::receivers::transaction_request_from_receivers;
 use crate::get_zennies_for_zingo_address;
 use crate::lightclient::LightClient;
+use crate::lightclient::error::{LightClientError, SendError};
 use crate::wallet::error::ProposeSendError;
 use crate::wallet::error::ProposeShieldError;
+use crate::wallet::error::WalletError;
+use crate::wallet::transparent::OpReturnData;
 
 impl LightClient {
     fn append_zingo_zenny_receiver(&self, receivers: &mut Vec<Receiver>) {
@@ -135,6 +139,123 @@ impl LightClient {
             self.release_proposal_pause(true);
         }
         result
+    }
+
+    /// Creates and stores a proposal to send `amount` to the transparent
+    /// address `recipient` with `data` in an OP_RETURN (null-data) output.
+    /// Holds the same stored-proposal pause as [`Self::propose_send`].
+    ///
+    /// The proposal reserves a new ephemeral transparent address. The
+    /// address is not released if the proposal is dropped. See
+    /// [`OpReturnProposal`] for the two transactions the proposal
+    /// describes and the fees it reports.
+    pub async fn propose_send_with_op_return(
+        &mut self,
+        recipient: &str,
+        amount: Zatoshis,
+        data: OpReturnData,
+        account_id: zip32::AccountId,
+    ) -> Result<OpReturnProposal, LightClientError> {
+        let minted = self.hold_proposal_pause();
+        let result = self
+            .create_op_return_proposal(recipient, amount, data, account_id)
+            .await;
+        match &result {
+            Ok(proposal) => self
+                .wallet()
+                .write()
+                .await
+                .store_proposal(ZingoProposal::OpReturn(proposal.clone())),
+            Err(_) if minted => self.release_proposal_pause(true),
+            Err(_) => (),
+        }
+        result
+    }
+
+    /// Builds an [`OpReturnProposal`] without storing it. Reserves the
+    /// ephemeral source address, sizes the OP_RETURN send fee, and creates
+    /// the deshield proposal for `amount` plus that fee.
+    pub(crate) async fn create_op_return_proposal(
+        &mut self,
+        recipient: &str,
+        amount: Zatoshis,
+        data: OpReturnData,
+        account_id: zip32::AccountId,
+    ) -> Result<OpReturnProposal, LightClientError> {
+        use zcash_protocol::consensus::Parameters as _;
+
+        let mut wallet = self.wallet().write().await;
+        let chain_type = wallet.chain_type();
+
+        let recipient = ZcashAddress::try_from_encoded(recipient)
+            .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?
+            .convert_if_network::<zcash_transparent::address::TransparentAddress>(
+                chain_type.network_type(),
+            )
+            .map_err(|_| SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent))?;
+
+        let (source_address_id, source_address) = wallet
+            .generate_refund_addresses(1, account_id)
+            .map_err(|e| SendError::OpReturn(WalletError::from(e)))?
+            .into_iter()
+            .next()
+            .expect("a request for one address yields one address");
+
+        let target_height = wallet
+            .get_migration_heights()
+            .map_err(SendError::OpReturn)?
+            .ok_or(SendError::OpReturn(WalletError::NoSyncData))?
+            .0;
+
+        let op_return_fee = wallet
+            .op_return_send_fee(
+                account_id,
+                source_address_id,
+                &source_address,
+                &recipient,
+                amount,
+                &data,
+                target_height,
+            )
+            .map_err(SendError::OpReturn)?;
+
+        let deshield_amount = (amount + op_return_fee).ok_or_else(|| {
+            SendError::OpReturn(WalletError::TransparentBuild(
+                "deshield amount overflows the zatoshi range".to_string(),
+            ))
+        })?;
+
+        let source_zcash_address = ZcashAddress::try_from_encoded(
+            &pepper_sync::keys::transparent::encode_address(&chain_type, source_address),
+        )
+        .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?;
+
+        let deshield_request = transaction_request_from_receivers(vec![Receiver::new(
+            source_zcash_address,
+            deshield_amount,
+            None,
+        )])
+        .map_err(|e| {
+            SendError::OpReturn(WalletError::TransparentBuild(format!(
+                "deshield request: {e}"
+            )))
+        })?;
+
+        let deshield = wallet
+            .create_send_proposal(deshield_request, account_id)
+            .map_err(SendError::ProposeSendError)?;
+
+        Ok(OpReturnProposal::new(
+            deshield,
+            account_id,
+            source_address_id,
+            source_address,
+            recipient,
+            amount,
+            data,
+            op_return_fee,
+            target_height,
+        ))
     }
 
     /// Returns the maximum value that can be sent from the given `account_id`.
@@ -1762,5 +1883,176 @@ mod sync_pause_contract {
             SyncMode::Paused,
             "a send that consumed nothing must release nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod op_return {
+    use pepper_sync::keys::transparent::TransparentScope;
+    use zcash_protocol::value::Zatoshis;
+
+    use crate::data::proposal::{ZingoProposal, total_payment_amount};
+    use crate::lightclient::LightClient;
+    use crate::lightclient::error::{LightClientError, SendError};
+    use crate::testutils::synthetic_wallet::SyntheticWalletBuilder;
+    use crate::wallet::error::WalletError;
+    use crate::wallet::keys::unified::ReceiverSelection;
+    use crate::wallet::transparent::OpReturnData;
+
+    const ACCOUNT: zip32::AccountId = zip32::AccountId::ZERO;
+    const PAYLOAD: &[u8] = b"zingolib op_return payload";
+
+    async fn client() -> LightClient {
+        let wallet = SyntheticWalletBuilder::new(zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED)
+            .orchard_note(1_000_000)
+            .build();
+        LightClient::new_for_test(wallet).await
+    }
+
+    fn data() -> OpReturnData {
+        OpReturnData::new(PAYLOAD.to_vec()).unwrap()
+    }
+
+    /// The proposal is stored as an OP_RETURN proposal. The deshield pays
+    /// the amount plus the OP_RETURN fee to a Refund-scope address. The
+    /// total fee is the sum of both fees.
+    #[tokio::test]
+    async fn proposal_is_stored_and_reports_both_fees() {
+        let mut client = client().await;
+        let amount = Zatoshis::const_from_u64(100_000);
+
+        let proposal = client
+            .propose_send_with_op_return(zingo_test_vectors::EXT_TADDR, amount, data(), ACCOUNT)
+            .await
+            .unwrap();
+
+        assert_eq!(proposal.amount(), amount);
+        assert_eq!(proposal.data(), &data());
+        assert!(u64::from(proposal.op_return_fee()) >= 10_000);
+        assert_eq!(u64::from(proposal.op_return_fee()) % 5_000, 0);
+        assert_eq!(
+            total_payment_amount(proposal.deshield()).unwrap(),
+            (amount + proposal.op_return_fee()).unwrap(),
+            "the deshield pays the amount plus the OP_RETURN fee"
+        );
+        assert_eq!(
+            proposal.total_fee().unwrap(),
+            (proposal.deshield_fee().unwrap() + proposal.op_return_fee()).unwrap()
+        );
+
+        let mut wallet = client.wallet().write().await;
+        let stored = wallet.take_proposal().expect("proposal stored");
+        assert!(matches!(stored, ZingoProposal::OpReturn(_)));
+        let source_id = wallet
+            .transparent_addresses()
+            .keys()
+            .find(|id| id.scope() == TransparentScope::Refund)
+            .expect("an ephemeral address was reserved");
+        let encoded = wallet.transparent_addresses()[source_id].clone();
+        assert_eq!(
+            encoded,
+            pepper_sync::keys::transparent::encode_address(
+                &wallet.chain_type(),
+                *proposal.source_address()
+            ),
+            "the deshield pays the reserved Refund-scope address"
+        );
+    }
+
+    /// Each proposal reserves a new ephemeral address.
+    #[tokio::test]
+    async fn each_proposal_reserves_a_new_source_address() {
+        let mut client = client().await;
+        let amount = Zatoshis::const_from_u64(100_000);
+
+        let first = client
+            .propose_send_with_op_return(zingo_test_vectors::EXT_TADDR, amount, data(), ACCOUNT)
+            .await
+            .unwrap();
+        let second = client
+            .propose_send_with_op_return(zingo_test_vectors::EXT_TADDR, amount, data(), ACCOUNT)
+            .await
+            .unwrap();
+
+        assert_ne!(first.source_address(), second.source_address());
+    }
+
+    /// A shielded recipient is refused. Nothing is stored.
+    #[tokio::test]
+    async fn shielded_recipient_is_refused() {
+        let mut client = client().await;
+        let unified = {
+            let mut wallet = client.wallet().write().await;
+            let (_, address) = wallet
+                .generate_unified_address(ReceiverSelection::orchard_only(), ACCOUNT)
+                .unwrap();
+            address.encode(&wallet.chain_type())
+        };
+
+        let result = client
+            .propose_send_with_op_return(
+                &unified,
+                Zatoshis::const_from_u64(100_000),
+                data(),
+                ACCOUNT,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LightClientError::SendError(SendError::OpReturn(
+                WalletError::OpReturnRecipientNotTransparent
+            )))
+        ));
+        assert!(client.wallet().write().await.take_proposal().is_none());
+    }
+
+    /// Insufficient shielded funds fail at the deshield proposal.
+    #[tokio::test]
+    async fn insufficient_funds_fail_at_the_deshield() {
+        let mut client = client().await;
+
+        let result = client
+            .propose_send_with_op_return(
+                zingo_test_vectors::EXT_TADDR,
+                Zatoshis::const_from_u64(5_000_000),
+                data(),
+                ACCOUNT,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LightClientError::SendError(SendError::ProposeSendError(_)))
+        ));
+    }
+
+    /// Offline calculation refuses an OP_RETURN proposal and keeps it
+    /// stored.
+    #[tokio::test]
+    async fn calculate_refuses_and_preserves_the_proposal() {
+        let mut client = client().await;
+        client
+            .propose_send_with_op_return(
+                zingo_test_vectors::EXT_TADDR,
+                Zatoshis::const_from_u64(100_000),
+                data(),
+                ACCOUNT,
+            )
+            .await
+            .unwrap();
+
+        let result = client.calculate_stored_proposal().await;
+
+        assert!(matches!(
+            result,
+            Err(LightClientError::SendError(
+                SendError::OpReturnNotCalculable
+            ))
+        ));
+        assert!(matches!(
+            client.wallet().write().await.take_proposal(),
+            Some(ZingoProposal::OpReturn(_))
+        ));
     }
 }

@@ -5,8 +5,8 @@
 //! output. The transaction is assembled directly with the upstream
 //! [`Builder`]. It spends one wallet-owned transparent output that a
 //! preceding deshield funded to the exact amount. It has no change output
-//! and no shielded bundle. See
-//! `LightClient::send_transparent_with_op_return` for the full flow.
+//! and no shielded bundle. See `LightClient::propose_send_with_op_return`
+//! for the full flow.
 //!
 //! `LightWallet::op_return_send_fee` sizes the fee before the deshield.
 //! `LightWallet::build_op_return_send` builds and records the
