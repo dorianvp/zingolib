@@ -195,6 +195,21 @@ pub enum SendError {
         "The OP_RETURN proposal is stale: its source address is no longer next. Propose again."
     )]
     OpReturnSourceAddressStale,
+    /// The deshield was transmitted and a later step failed. If
+    /// `op_return_txid` is `None`, the proposal is stored again with the
+    /// deshield txid and `send_stored_proposal` resumes from the OP_RETURN
+    /// step. If it is `Some`, the OP_RETURN transaction is in the wallet
+    /// with `Calculated` status and `transmit_calculated` resends it.
+    #[error("OP_RETURN send failed after the deshield {deshield_txid} was transmitted. {source}")]
+    OpReturnAfterDeshield {
+        /// The transmitted deshield.
+        deshield_txid: TxId,
+        /// The calculated OP_RETURN transaction, if it was built.
+        op_return_txid: Option<TxId>,
+        /// The failure.
+        #[source]
+        source: Box<LightClientError>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

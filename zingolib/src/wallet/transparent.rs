@@ -100,59 +100,41 @@ impl LightWallet {
     }
 
     /// The ZIP-317 fee for the OP_RETURN send. The transaction has one
-    /// P2PKH input from `source`, one P2PKH output to `recipient`, and one
-    /// null-data output carrying `data`.
+    /// P2PKH input, one output to `recipient`, and one null-data output
+    /// carrying `data`.
     ///
-    /// A throwaway builder of the exact transaction shape is assembled and
-    /// the upstream fee rule sizes it. The fee depends on output sizes
-    /// only. The placeholder input value does not affect the result.
-    #[allow(clippy::too_many_arguments)]
+    /// The upstream fee rule sizes the transaction from its input and
+    /// output sizes. No keys are needed. A watch-only wallet can size the
+    /// fee.
     pub(crate) fn op_return_send_fee(
         &self,
-        account_id: zip32::AccountId,
-        source_address_id: TransparentAddressId,
-        source: &TransparentAddress,
         recipient: &TransparentAddress,
-        amount: Zatoshis,
         data: &OpReturnData,
         target_height: BlockHeight,
     ) -> Result<Zatoshis, WalletError> {
-        let usk = self.unified_spending_key(account_id)?;
-        let secret_key = usk
-            .transparent()
-            .derive_secret_key(
-                TransparentKeyScope::from(source_address_id.scope()),
-                source_address_id.address_index(),
-            )
-            .map_err(|e| {
-                WalletError::TransparentBuild(format!("transparent key derivation: {e}"))
-            })?;
-        let pubkey = TransparentSigningSet::new().add_key(secret_key);
-        let script = source.script().into();
+        use zcash_primitives::transaction::fees::FeeRule as _;
+        use zcash_primitives::transaction::fees::transparent::{InputSize, OutputView as _};
+        use zcash_transparent::builder::TransparentBuilder;
 
-        let mut builder = Builder::new(
-            self.chain_type,
-            target_height,
-            transparent_only_build_config(),
-        );
-        builder
-            .add_transparent_p2pkh_input(
-                pubkey,
-                OutPoint::new([0u8; 32], 0),
-                TxOut::new(amount, script),
-            )
-            .map_err(|e| WalletError::TransparentBuild(format!("fee estimate input: {e:?}")))?;
-        builder
-            .add_transparent_output(recipient, amount)
-            .map_err(|e| {
-                WalletError::TransparentBuild(format!("fee estimate recipient output: {e:?}"))
-            })?;
-        builder
-            .add_transparent_null_data_output::<std::convert::Infallible>(data.as_bytes())
+        let mut outputs = TransparentBuilder::empty();
+        outputs.add_output(recipient, Zatoshis::ZERO).map_err(|e| {
+            WalletError::TransparentBuild(format!("fee estimate recipient output: {e:?}"))
+        })?;
+        outputs
+            .add_null_data_output(data.as_bytes())
             .map_err(|e| WalletError::TransparentBuild(format!("fee estimate op_return: {e:?}")))?;
 
-        builder
-            .get_fee(&zip317::FeeRule::standard())
+        zip317::FeeRule::standard()
+            .fee_required(
+                &self.chain_type,
+                target_height,
+                [InputSize::STANDARD_P2PKH],
+                outputs.outputs().iter().map(|out| out.serialized_size()),
+                0,
+                0,
+                0,
+                0,
+            )
             .map_err(|e| WalletError::TransparentBuild(format!("fee estimate: {e:?}")))
     }
 
@@ -408,15 +390,7 @@ mod tests {
             .expect("synced wallet has heights")
             .0;
         let fee = wallet
-            .op_return_send_fee(
-                ACCOUNT,
-                source_id,
-                &source,
-                &recipient,
-                amount,
-                &data,
-                target_height,
-            )
+            .op_return_send_fee(&recipient, &data, target_height)
             .expect("fee estimate");
         (
             source_id,
@@ -512,6 +486,52 @@ mod tests {
             Some(fee),
             "input funds the payment and the fee exactly"
         );
+    }
+
+    /// The keyless fee is exact. An input worth amount plus that fee
+    /// builds with no change output, for every push-encoding class of the
+    /// payload and for a P2SH recipient. The builder's value-balance check
+    /// rejects any other fee.
+    #[test]
+    fn keyless_fee_balances_the_built_transaction() {
+        let mut wallet = synced_wallet();
+        let amount = Zatoshis::const_from_u64(100_000);
+        let p2sh = TransparentAddress::ScriptHash([3u8; 20]);
+        let cases = [
+            (recipient(), 0usize),
+            (recipient(), 1),
+            (recipient(), 75),
+            (recipient(), 76),
+            (recipient(), 80),
+            (p2sh, 80),
+        ];
+        for (recipient, payload_len) in cases {
+            let data = OpReturnData::new(vec![0xab; payload_len]).unwrap();
+            let (source_id, source) = wallet.generate_refund_addresses(1, ACCOUNT).unwrap()[0];
+            let target_height = wallet.get_migration_heights().unwrap().unwrap().0;
+            let fee = wallet
+                .op_return_send_fee(&recipient, &data, target_height)
+                .unwrap();
+            let txout = TxOut::new((amount + fee).unwrap(), source.script().into());
+            let raw = wallet
+                .build_op_return_send_raw(
+                    ACCOUNT,
+                    source_id,
+                    OutPoint::new([7u8; 32], 0),
+                    txout,
+                    &recipient,
+                    amount,
+                    &data,
+                    target_height,
+                )
+                .unwrap_or_else(|e| panic!("payload {payload_len} to {recipient:?}: {e}"));
+            let transaction = read_tx(&wallet, &raw, target_height);
+            assert_eq!(
+                transaction.transparent_bundle().unwrap().vout.len(),
+                2,
+                "payload {payload_len}: recipient + OP_RETURN, no change"
+            );
+        }
     }
 
     /// The ZIP-317 fee is a positive multiple of the marginal fee. An

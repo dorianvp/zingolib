@@ -139,9 +139,8 @@ pub enum WalletError {
         "Cannot create a new wallet: a wallet file already exists at this path. Use WalletConfig::Read to load the existing wallet."
     )]
     WalletAlreadyCreated,
-    /// The OP_RETURN send recipient is not a transparent address. The send
-    /// must pay a `t`-address.
-    #[error("OP_RETURN send recipient is not a transparent (t) address.")]
+    /// The OP_RETURN send recipient is not a P2PKH, P2SH, or TEX address.
+    #[error("OP_RETURN send recipient must be a P2PKH, P2SH, or TEX address.")]
     OpReturnRecipientNotTransparent,
     /// The deshield transaction has no transparent output paying the
     /// reserved source address. This is an internal invariant failure.

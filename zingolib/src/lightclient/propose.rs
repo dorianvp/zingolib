@@ -106,7 +106,8 @@ impl LightClient {
 
     /// Creates and stores a proposal to send `amount` to the transparent
     /// address `recipient` with `data` in an OP_RETURN (null-data) output.
-    /// Holds the same stored-proposal pause as [`Self::propose_send`].
+    /// `recipient` is a P2PKH, P2SH, or TEX address. Holds the same
+    /// stored-proposal pause as [`Self::propose_send`].
     ///
     /// The ephemeral source address is derived, not reserved. The wallet
     /// reserves it in [`Self::send_stored_proposal`], when the deshield
@@ -151,12 +152,20 @@ impl LightClient {
         let mut wallet = self.wallet().write().await;
         let chain_type = wallet.chain_type();
 
-        let recipient = ZcashAddress::try_from_encoded(recipient)
+        let recipient = match ZcashAddress::try_from_encoded(recipient)
             .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?
-            .convert_if_network::<zcash_transparent::address::TransparentAddress>(
-                chain_type.network_type(),
-            )
-            .map_err(|_| SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent))?;
+            .convert_if_network::<zcash_keys::address::Address>(chain_type.network_type())
+        {
+            Ok(zcash_keys::address::Address::Transparent(address)) => address,
+            Ok(zcash_keys::address::Address::Tex(hash)) => {
+                zcash_transparent::address::TransparentAddress::PublicKeyHash(hash)
+            }
+            _ => {
+                return Err(
+                    SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent).into(),
+                );
+            }
+        };
 
         let (source_address_id, source_address) = wallet
             .derive_refund_addresses(1, account_id)
@@ -172,15 +181,7 @@ impl LightClient {
             .0;
 
         let op_return_fee = wallet
-            .op_return_send_fee(
-                account_id,
-                source_address_id,
-                &source_address,
-                &recipient,
-                amount,
-                &data,
-                target_height,
-            )
+            .op_return_send_fee(&recipient, &data, target_height)
             .map_err(SendError::OpReturn)?;
 
         let deshield_amount = (amount + op_return_fee).ok_or_else(|| {
@@ -218,7 +219,6 @@ impl LightClient {
             amount,
             data,
             op_return_fee,
-            target_height,
         ))
     }
 
@@ -2186,6 +2186,51 @@ mod op_return {
                 .all(|id| id.scope() != TransparentScope::Refund),
             "no Refund-scope address was reserved"
         );
+    }
+
+    /// The network of the test wallet.
+    async fn network(client: &LightClient) -> zcash_protocol::consensus::NetworkType {
+        use zcash_protocol::consensus::Parameters as _;
+        client.wallet().read().await.chain_type().network_type()
+    }
+
+    /// A TEX recipient is accepted. The proposal pays the P2PKH hash it
+    /// wraps.
+    #[tokio::test]
+    async fn tex_recipient_is_accepted() {
+        use zcash_address::ToAddress as _;
+        use zcash_transparent::address::TransparentAddress;
+        let mut client = client().await;
+        let hash = [4u8; 20];
+        let tex = zcash_address::ZcashAddress::from_tex(network(&client).await, hash).encode();
+
+        let proposal = client
+            .propose_send_with_op_return(&tex, Zatoshis::const_from_u64(100_000), data(), ACCOUNT)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            proposal.recipient(),
+            &TransparentAddress::PublicKeyHash(hash)
+        );
+    }
+
+    /// A P2SH recipient is accepted.
+    #[tokio::test]
+    async fn p2sh_recipient_is_accepted() {
+        use zcash_address::ToAddress as _;
+        use zcash_transparent::address::TransparentAddress;
+        let mut client = client().await;
+        let hash = [5u8; 20];
+        let p2sh = zcash_address::ZcashAddress::from_transparent_p2sh(network(&client).await, hash)
+            .encode();
+
+        let proposal = client
+            .propose_send_with_op_return(&p2sh, Zatoshis::const_from_u64(100_000), data(), ACCOUNT)
+            .await
+            .unwrap();
+
+        assert_eq!(proposal.recipient(), &TransparentAddress::ScriptHash(hash));
     }
 
     /// A shielded recipient is refused. Nothing is stored.

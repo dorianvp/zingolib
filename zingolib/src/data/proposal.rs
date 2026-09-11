@@ -3,8 +3,8 @@
 use std::convert::Infallible;
 
 use zcash_client_backend::proposal::Proposal;
+use zcash_primitives::transaction::TxId;
 use zcash_primitives::transaction::fees::zip317;
-use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::{BalanceError, Zatoshis};
 use zcash_transparent::address::TransparentAddress;
 
@@ -57,6 +57,10 @@ pub(crate) enum ZingoProposal {
 /// The second transaction cannot be built before the first exists. Its
 /// fee is fixed at proposal time and is reported by
 /// [`OpReturnProposal::op_return_fee`].
+///
+/// If a step fails after the deshield is transmitted, the proposal is
+/// stored again with [`OpReturnProposal::deshield_txid`] set.
+/// `send_stored_proposal` then resumes from the OP_RETURN step.
 #[derive(Debug, Clone)]
 pub struct OpReturnProposal {
     deshield: ProportionalFeeProposal,
@@ -67,7 +71,7 @@ pub struct OpReturnProposal {
     amount: Zatoshis,
     data: OpReturnData,
     op_return_fee: Zatoshis,
-    target_height: BlockHeight,
+    deshield_txid: Option<TxId>,
 }
 
 impl OpReturnProposal {
@@ -81,7 +85,6 @@ impl OpReturnProposal {
         amount: Zatoshis,
         data: OpReturnData,
         op_return_fee: Zatoshis,
-        target_height: BlockHeight,
     ) -> Self {
         Self {
             deshield,
@@ -92,7 +95,7 @@ impl OpReturnProposal {
             amount,
             data,
             op_return_fee,
-            target_height,
+            deshield_txid: None,
         }
     }
 
@@ -147,8 +150,15 @@ impl OpReturnProposal {
         (self.deshield_fee()? + self.op_return_fee).ok_or(BalanceError::Overflow)
     }
 
-    pub(crate) fn target_height(&self) -> BlockHeight {
-        self.target_height
+    /// The txid of the transmitted deshield, when a later step failed.
+    /// `None` until the deshield is transmitted.
+    pub fn deshield_txid(&self) -> Option<TxId> {
+        self.deshield_txid
+    }
+
+    pub(crate) fn with_deshield_txid(mut self, txid: TxId) -> Self {
+        self.deshield_txid = Some(txid);
+        self
     }
 }
 
