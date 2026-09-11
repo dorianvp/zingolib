@@ -755,24 +755,26 @@ impl LightClient {
         reports
     }
 
-    /// Makes a swap deposit to a transparent THORChain / MAYAChain vault,
-    /// attaching `memo` as an OP_RETURN.
+    /// Sends `amount` to the transparent address `recipient` with `data`
+    /// in an OP_RETURN (null-data) output.
     ///
-    /// The deposit is two transactions, the same shape as a ZIP-320 TEX
-    /// pair: a deshield from shielded funds to a freshly reserved,
-    /// wallet-owned transparent address, then a transparent memo carrier
-    /// spending that output to `vault_address` with the swap memo in an
-    /// OP_RETURN. The carrier's transparent input is the sender THORChain /
-    /// MAYAChain derive their refund address from, so the deposit is
-    /// refundable; a shielded-funded deposit would not be. The deshield
-    /// funds the carrier exactly, so the carrier has no change output.
+    /// The send is two transactions with the same shape as a ZIP-320 TEX
+    /// pair. The first is a deshield from shielded funds to a newly
+    /// reserved ephemeral transparent address. The second is a
+    /// transparent-only transaction that spends that output to
+    /// `recipient` and carries `data` in an OP_RETURN. The deshield funds
+    /// the second transaction to the exact amount plus fee. The second
+    /// transaction has no change output. Its single transparent input
+    /// identifies the sender on chain.
+    ///
+    /// The ephemeral address is used once. Each call reserves a new one.
     ///
     /// Returns the transmit reports for both transactions, deshield first.
-    pub async fn propose_swap_deposit(
+    pub async fn send_transparent_with_op_return(
         &mut self,
-        vault_address: &str,
+        recipient: &str,
         amount: zcash_protocol::value::Zatoshis,
-        memo: crate::wallet::op_return::OpReturnData,
+        data: crate::wallet::transparent::OpReturnData,
         account_id: zip32::AccountId,
         resume_sync: bool,
     ) -> Result<NonEmpty<TransmitReport>, LightClientError> {
@@ -781,67 +783,69 @@ impl LightClient {
         use crate::data::receivers::{Receiver, transaction_request_from_receivers};
         use crate::wallet::error::WalletError;
 
-        let (deshield_request, carrier_address_id, carrier_address, vault, target_height) = {
+        let (deshield_request, source_address_id, source_address, recipient, target_height) = {
             let mut wallet = self.wallet().write().await;
             let chain_type = wallet.chain_type();
 
-            let vault = zcash_address::ZcashAddress::try_from_encoded(vault_address)
-                .map_err(|e| SendError::SwapDeposit(WalletError::ParseError(e)))?
+            let recipient = zcash_address::ZcashAddress::try_from_encoded(recipient)
+                .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?
                 .convert_if_network::<zcash_transparent::address::TransparentAddress>(
                     chain_type.network_type(),
                 )
-                .map_err(|_| SendError::SwapDeposit(WalletError::SwapVaultNotTransparent))?;
+                .map_err(|_| SendError::OpReturn(WalletError::OpReturnRecipientNotTransparent))?;
 
-            let (carrier_address_id, carrier_address) = wallet
+            let (source_address_id, source_address) = wallet
                 .generate_refund_addresses(1, account_id)
-                .map_err(|e| SendError::SwapDeposit(WalletError::from(e)))?
+                .map_err(|e| SendError::OpReturn(WalletError::from(e)))?
                 .into_iter()
                 .next()
                 .expect("a request for one address yields one address");
 
             let target_height = wallet
                 .get_migration_heights()
-                .map_err(SendError::SwapDeposit)?
-                .ok_or(SendError::SwapDeposit(WalletError::NoSyncData))?
+                .map_err(SendError::OpReturn)?
+                .ok_or(SendError::OpReturn(WalletError::NoSyncData))?
                 .0;
 
-            let carrier_fee = wallet
-                .op_return_carrier_fee(
+            let send_fee = wallet
+                .op_return_send_fee(
                     account_id,
-                    carrier_address_id,
-                    &carrier_address,
-                    &vault,
+                    source_address_id,
+                    &source_address,
+                    &recipient,
                     amount,
-                    &memo,
+                    &data,
                     target_height,
                 )
-                .map_err(SendError::SwapDeposit)?;
+                .map_err(SendError::OpReturn)?;
 
-            let deshield_amount = (amount + carrier_fee).ok_or_else(|| {
-                SendError::SwapDeposit(WalletError::SwapBuild(
+            let deshield_amount = (amount + send_fee).ok_or_else(|| {
+                SendError::OpReturn(WalletError::TransparentBuild(
                     "deshield amount overflows the zatoshi range".to_string(),
                 ))
             })?;
 
-            let carrier_zcash_address = zcash_address::ZcashAddress::try_from_encoded(
-                &pepper_sync::keys::transparent::encode_address(&chain_type, carrier_address),
+            let source_zcash_address = zcash_address::ZcashAddress::try_from_encoded(
+                &pepper_sync::keys::transparent::encode_address(&chain_type, source_address),
             )
-            .map_err(|e| SendError::SwapDeposit(WalletError::ParseError(e)))?;
+            .map_err(|e| SendError::OpReturn(WalletError::ParseError(e)))?;
 
             let deshield_request = transaction_request_from_receivers(vec![Receiver::new(
-                carrier_zcash_address,
+                source_zcash_address,
                 deshield_amount,
                 None,
             )])
             .map_err(|e| {
-                SendError::SwapDeposit(WalletError::SwapBuild(format!("deshield request: {e}")))
+                SendError::OpReturn(WalletError::TransparentBuild(format!(
+                    "deshield request: {e}"
+                )))
             })?;
 
             (
                 deshield_request,
-                carrier_address_id,
-                carrier_address,
-                vault,
+                source_address_id,
+                source_address,
+                recipient,
                 target_height,
             )
         };
@@ -851,30 +855,30 @@ impl LightClient {
             .await?;
         let deshield_txid = deshield_reports.first().txid;
 
-        let carrier_txid = {
+        let op_return_txid = {
             let mut wallet = self.wallet().write().await;
-            let (carrier_outpoint, carrier_txout) = wallet
-                .locate_deshield_output(deshield_txid, &carrier_address)
-                .map_err(SendError::SwapDeposit)?;
+            let (source_outpoint, source_txout) = wallet
+                .find_transparent_output(deshield_txid, &source_address)
+                .map_err(SendError::OpReturn)?;
             wallet
-                .build_op_return_carrier(
+                .build_op_return_send(
                     account_id,
-                    carrier_address_id,
-                    carrier_outpoint,
-                    carrier_txout,
-                    &vault,
+                    source_address_id,
+                    source_outpoint,
+                    source_txout,
+                    &recipient,
                     amount,
-                    &memo,
+                    &data,
                     target_height,
                 )
-                .map_err(SendError::SwapDeposit)?
+                .map_err(SendError::OpReturn)?
         };
-        let carrier_reports = self
-            .transmit_transactions(NonEmpty::new(carrier_txid))
+        let op_return_reports = self
+            .transmit_transactions(NonEmpty::new(op_return_txid))
             .await?;
 
         let mut reports = deshield_reports;
-        for report in carrier_reports {
+        for report in op_return_reports {
             reports.push(report);
         }
         Ok(reports)

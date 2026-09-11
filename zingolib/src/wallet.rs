@@ -11,7 +11,7 @@ use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_transparent::keys::NonHardenedChildIndex;
 
-use pepper_sync::keys::transparent::{self, TransparentScope};
+use pepper_sync::keys::transparent::{TransparentScope, encode_address};
 use pepper_sync::wallet::{KeyIdInterface, ScanTarget, ShardTrees};
 use pepper_sync::{
     keys::transparent::TransparentAddressId,
@@ -35,14 +35,13 @@ pub mod disk;
 pub mod keys;
 pub mod locks;
 pub mod migration;
-pub mod op_return;
 pub mod output;
 pub mod propose;
 pub mod send;
 pub mod summary;
-pub mod swap;
 pub mod sync;
 pub mod transaction;
+pub mod transparent;
 mod zcb_traits;
 
 pub use pepper_sync::config::{
@@ -225,7 +224,7 @@ impl LightWallet {
             Ok(first_transparent_address) => {
                 transparent_addresses.insert(
                     transparent_address_id,
-                    transparent::encode_address(&chain_type, first_transparent_address),
+                    encode_address(&chain_type, first_transparent_address),
                 );
             }
             Err(KeyError::NoViewCapability) => (),

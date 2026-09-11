@@ -182,9 +182,9 @@ pub enum SendError {
     /// Transmission error.
     #[error("Transmission error.")]
     TransmissionError(#[from] TransmissionError),
-    /// Swap deposit (OP_RETURN memo carrier) error.
-    #[error("Swap deposit error. {0}")]
-    SwapDeposit(crate::wallet::error::WalletError),
+    /// OP_RETURN send error.
+    #[error("OP_RETURN send error. {0}")]
+    OpReturn(crate::wallet::error::WalletError),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1689,17 +1689,16 @@ async fn mine_to_transparent_coinbase_maturity() {
     assert_eq!(mature_balance, scenarios::mined_block_rewards_total(3));
 }
 
-/// A THORChain / MAYAChain swap deposit round-trips on regtest: from a
-/// shielded balance, `propose_swap_deposit` broadcasts a deshield and a
-/// transparent memo carrier, and once mined the carrier confirms as a
-/// transparent transaction paying the vault with the swap memo in an
-/// OP_RETURN output and no change.
+/// `send_transparent_with_op_return` broadcasts a deshield and a
+/// transparent-only transaction from a shielded balance. After mining,
+/// both confirm. The second transaction pays the recipient, carries the
+/// payload in an OP_RETURN output, and has no change.
 #[tokio::test]
-async fn swap_deposit_carries_op_return_to_vault_on_chain() {
-    use zingolib::wallet::op_return::OpReturnData;
+async fn send_transparent_with_op_return_confirms_on_chain() {
+    use zingolib::wallet::transparent::OpReturnData;
 
-    /// A representative MAYAChain swap memo, well under the 80-byte limit.
-    const MEMO: &[u8] = b"=:ZEC.ZEC:tz==maya1abcdefghij:100000000";
+    /// A payload under the 80-byte limit.
+    const PAYLOAD: &[u8] = b"zingolib op_return payload";
     let amount = Zatoshis::const_from_u64(100_000);
 
     let (ref local_net, mut faucet, mut recipient) = scenarios::faucet_recipient_default().await;
@@ -1716,16 +1715,26 @@ async fn swap_deposit_carries_op_return_to_vault_on_chain() {
     .await;
     recipient.sync_and_await().await.unwrap();
 
-    let vault_address = get_base_address_macro!(faucet, "transparent");
-    let memo = OpReturnData::new(MEMO.to_vec()).unwrap();
+    let recipient_address = get_base_address_macro!(faucet, "transparent");
+    let data = OpReturnData::new(PAYLOAD.to_vec()).unwrap();
 
     let reports = recipient
-        .propose_swap_deposit(&vault_address, amount, memo, zip32::AccountId::ZERO, false)
+        .send_transparent_with_op_return(
+            &recipient_address,
+            amount,
+            data,
+            zip32::AccountId::ZERO,
+            false,
+        )
         .await
         .unwrap();
-    assert_eq!(reports.len(), 2, "a deshield and a memo carrier are sent");
+    assert_eq!(
+        reports.len(),
+        2,
+        "a deshield and an OP_RETURN send are sent"
+    );
     let deshield_txid = reports[0].txid;
-    let carrier_txid = reports[1].txid;
+    let op_return_txid = reports[1].txid;
 
     increase_height_and_wait_for_client(local_net, &mut recipient, 3)
         .await
@@ -1740,24 +1749,27 @@ async fn swap_deposit_carries_op_return_to_vault_on_chain() {
         .expect("deshield recorded");
     assert!(deshield.status().is_confirmed(), "deshield confirmed");
 
-    let carrier = wallet
+    let op_return_tx = wallet
         .wallet_transactions
-        .get(&carrier_txid)
-        .expect("carrier recorded");
-    assert!(carrier.status().is_confirmed(), "carrier confirmed");
-
-    let bundle = carrier
-        .transaction()
-        .transparent_bundle()
-        .expect("carrier is a transparent transaction");
-
-    assert_eq!(
-        bundle.vin.len(),
-        1,
-        "carrier spends the single deshield output"
+        .get(&op_return_txid)
+        .expect("OP_RETURN send recorded");
+    assert!(
+        op_return_tx.status().is_confirmed(),
+        "OP_RETURN send confirmed"
     );
 
-    assert_eq!(bundle.vout.len(), 2, "vault + OP_RETURN, no change output");
+    let bundle = op_return_tx
+        .transaction()
+        .transparent_bundle()
+        .expect("OP_RETURN send is a transparent transaction");
+
+    assert_eq!(bundle.vin.len(), 1, "spends the single deshield output");
+
+    assert_eq!(
+        bundle.vout.len(),
+        2,
+        "recipient + OP_RETURN, no change output"
+    );
 
     let op_return_out = bundle
         .vout
@@ -1767,19 +1779,19 @@ async fn swap_deposit_carries_op_return_to_vault_on_chain() {
     let script = op_return_out.script_pubkey().0.0.clone();
     assert_eq!(script[0], 0x6a, "null-data script starts with OP_RETURN");
     assert!(
-        script.windows(MEMO.len()).any(|w| w == MEMO),
-        "the OP_RETURN carries the memo payload verbatim"
+        script.windows(PAYLOAD.len()).any(|w| w == PAYLOAD),
+        "the OP_RETURN carries the payload verbatim"
     );
 
-    let vault_out = bundle
+    let recipient_out = bundle
         .vout
         .iter()
         .find(|out| out.value() == amount)
-        .expect("a vault output paying the deposit amount");
+        .expect("a recipient output paying the amount");
     assert_ne!(
-        vault_out.value(),
+        recipient_out.value(),
         Zatoshis::ZERO,
-        "the vault output is the non-null-data output"
+        "the recipient output is the non-null-data output"
     );
 }
 
