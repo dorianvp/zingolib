@@ -902,26 +902,22 @@ impl LightClient {
             .ok_or(MigrationError::NoMigration)?
     }
 
-    /// The transmit-only client parts are submitted through, resolved by the
-    /// Mixnet Mode policy (ADR 0011, amendment 2026-07-23) like every other
-    /// transmitting surface.
-    ///
-    /// While the mode is on, parts travel ONLY over the mixnet (failing
+    /// Under the mixnet policy, parts travel ONLY over the mixnet (failing
     /// closed with [`MixnetNotReady`](crate::mixnet::MixnetNotReady) while the
     /// proxy bootstraps or after it dies) to one Destination drawn at
     /// random per submission, with the synchronization endpoint's operator
     /// forbidden as a target (ADR 0022: a `migration_transmission_uri` on the
     /// sync operator's domain is refused, and the draw excludes that
-    /// operator). Clearnet carries parts only when the user deliberately
-    /// toggled the mode off, or in a build without the `nym` feature: then
-    /// the dedicated `migration_transmission_uri` when configured, else the
+    /// operator). Clearnet carries parts only under the clearnet policy, or
+    /// in a build without the `nym` feature: then the dedicated
+    /// `migration_transmission_uri` when configured, else the
     /// synchronization endpoint with a logged correlation warning, else
     /// [`LightClientError::Offline`] with no traffic emitted.
     fn migration_transmission_client(
         &self,
     ) -> Result<transmission_route::RoutedTransmissionClient, LightClientError> {
         #[cfg(feature = "nym")]
-        if let crate::mixnet::MixnetRoute::Mixnet(conduit) = self.mixnet_route()? {
+        if let crate::mixnet::MixnetRoute::Mixnet(conduit) = self.send_route()? {
             // The guard travels into the client, which dials on every
             // submission long after this function returns.
             let dial = conduit.dial();

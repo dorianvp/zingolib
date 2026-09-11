@@ -305,12 +305,8 @@ async fn confirm(lightclient: &mut LightClient) -> Result<String, CommandError> 
 async fn current_price(lightclient: &mut LightClient) -> Result<String, CommandError> {
     match lightclient.update_current_price().await {
         Ok(fetch) => {
-            let route = match &fetch.route {
-                zingolib::lightclient::PriceFetchRoute::Mixnet { via_socks5 } => {
-                    format!("over the mixnet via {via_socks5}")
-                }
-                zingolib::lightclient::PriceFetchRoute::Clearnet => "over clearnet".to_string(),
-            };
+            let zingolib::lightclient::PriceFetchRoute::Mixnet { via_socks5 } = &fetch.route;
+            let route = format!("over the mixnet via {via_socks5}");
             Ok(format!(
                 "current price: {} USD (source: {}, rtt: {} ms, fetched {})",
                 fetch.usd,
@@ -1348,7 +1344,8 @@ fn render_status(
              `network on` to enable the mixnet, or `network off` to use clearnet."
             .to_string(),
         Indicator::SwitchedOff => {
-            "Mixnet Mode: switched off (send and price-fetch use clearnet)".to_string()
+            "Mixnet Mode: switched off (price-fetch refuses; send follows the transmit policy)"
+                .to_string()
         }
         Indicator::Bootstrapping => match bootstrap_detail {
             Some(detail) => format!(

@@ -101,7 +101,7 @@ pub struct TransmitReport {
 
 /// Resolves whether a transmission runs over the mixnet tunnel (`Some`
 /// SOCKS5 address) or clearnet through the configured sync indexer
-/// (`None`), from the session's connectivity and its Mixnet Mode route.
+/// (`None`), from the session's connectivity and its send route.
 ///
 /// An Indexerless session transmits only over a ready mixnet (ruling
 /// 2026-07-29): the Destination escalation needs no sync indexer, so
@@ -690,7 +690,7 @@ impl LightClient {
     fn preflight_transmit(&self) -> Result<(), LightClientError> {
         #[cfg(feature = "nym")]
         {
-            resolve_transmit_route(self.indexer.is_some(), self.mixnet_route()).map(|_| ())
+            resolve_transmit_route(self.indexer.is_some(), self.send_route()).map(|_| ())
         }
         #[cfg(not(feature = "nym"))]
         {
@@ -961,7 +961,8 @@ impl LightClient {
     ) -> Result<NonEmpty<TransmitReport>, LightClientError> {
         let indexer = self.indexer.clone();
 
-        // Resolve the Mixnet Mode route once for the whole send (ADR 0011).
+        // Resolve the send route once for the whole send (ADR 0011), under
+        // the session's transmit policy as it stands at this moment.
         // `Clearnet` submits through the configured indexer; `Mixnet(conduit)`
         // routes the escalation through the conduit's SOCKS5 proxy — with or without a
         // sync indexer (ruling 2026-07-29); `Bootstrapping` fails closed
@@ -971,7 +972,7 @@ impl LightClient {
         // The guard is bound for the whole send, so the conduit counts this
         // transmission as outstanding until the escalation finishes.
         #[cfg(feature = "nym")]
-        let transmit_dial = resolve_transmit_route(indexer.is_some(), self.mixnet_route())?;
+        let transmit_dial = resolve_transmit_route(indexer.is_some(), self.send_route())?;
         #[cfg(feature = "nym")]
         let socks5_proxy: Option<std::net::SocketAddr> =
             transmit_dial.as_ref().map(|dial| dial.socks5());
@@ -984,15 +985,18 @@ impl LightClient {
             return Err(LightClientError::Offline);
         }
 
-        // A test-attached slot pairs its Ready route with arms that submit
+        // A test-attached slot pairs its mixnet route with arms that submit
         // over the mock indexer's channel; a live Ready session keeps the
-        // SOCKS5 escalation. Production builds carry no test slot state, so
-        // this distinction does not exist there.
+        // SOCKS5 escalation, and a clearnet-policy send over a test slot
+        // takes the clearnet arm as it would in production. Production
+        // builds carry no test slot state, so this distinction does not
+        // exist there.
         #[cfg(all(feature = "nym", any(test, feature = "testutils")))]
-        let mock_arms = matches!(
-            *self.mixnet_slot.lock().expect("mixnet slot mutex"),
-            crate::mixnet::MixnetSlot::AttachedForTests { .. }
-        );
+        let mock_arms = socks5_proxy.is_some()
+            && matches!(
+                *self.mixnet_slot.lock().expect("mixnet slot mutex"),
+                crate::mixnet::MixnetSlot::AttachedForTests { .. }
+            );
 
         // Narrate the transmission into the side channel; the scope clears it
         // on every exit so no stale line outlives this call.

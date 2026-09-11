@@ -753,7 +753,7 @@ mod network_command_parsing {
         );
         assert_eq!(
             render_status(Indicator::SwitchedOff, None, None),
-            "Mixnet Mode: switched off (send and price-fetch use clearnet)"
+            "Mixnet Mode: switched off (price-fetch refuses; send follows the transmit policy)"
         );
         assert_eq!(
             render_status(Indicator::Bootstrapping, None, None),
